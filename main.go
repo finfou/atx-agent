@@ -39,7 +39,7 @@ import (
 	"github.com/openatx/atx-agent/cmdctrl"
 	"github.com/pkg/errors"
 	"github.com/rs/cors"
-	"github.com/shogo82148/androidbinary/apk"
+	"github.com/finfou/androidbinary/apk"
 )
 
 var (
@@ -861,7 +861,7 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 			}
 
 			state.Message = "apk parsing"
-			pkg, er := apk.OpenFile(filepath)
+			pkg, er := apk.OpenFile1(filepath)
 			if er != nil {
 				state.Error = er.Error()
 				state.Message = "androidbinary parse apk error"
