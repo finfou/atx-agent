@@ -32,6 +32,7 @@ import (
 
 	"github.com/codeskyblue/kexec"
 	"github.com/codeskyblue/procfs"
+	"github.com/finfou/androidbinary/apk"
 	"github.com/franela/goreq"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
@@ -39,7 +40,6 @@ import (
 	"github.com/openatx/atx-agent/cmdctrl"
 	"github.com/pkg/errors"
 	"github.com/rs/cors"
-	"github.com/finfou/androidbinary/apk"
 )
 
 var (
@@ -655,6 +655,7 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 					f.Flush()
 				}
 			} else {
+				log.Println(err)
 				log.Println("Write error")
 			}
 			return n, err
