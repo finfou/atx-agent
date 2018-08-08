@@ -12,7 +12,6 @@ import (
 	"html/template"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -30,15 +29,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/codeskyblue/kexec"
 	"github.com/codeskyblue/procfs"
 	"github.com/franela/goreq"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
+	"github.com/mholt/archiver"
 	"github.com/openatx/androidutils"
 	"github.com/openatx/atx-agent/cmdctrl"
 	"github.com/pkg/errors"
+	"github.com/qiniu/log"
 	"github.com/rs/cors"
+	"github.com/sevlyar/go-daemon"
 	"github.com/shogo82148/androidbinary/apk"
 )
 
@@ -53,11 +54,17 @@ var (
 			return true
 		},
 	}
+
+	version    = "dev"
+	owner      = "openatx"
+	repo       = "atx-agent"
+	listenPort int
 )
 
-func init() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-}
+const (
+	apkVersionCode = 4
+	apkVersionName = "1.0.4"
+)
 
 // singleFight for http request
 // - minicap
@@ -201,11 +208,6 @@ func updateMinicapRotation(rotation int) {
 	service.UpdateArgs("minicap", minicapbin, "-S", "-P",
 		fmt.Sprintf("%dx%d@%dx%d/%d", width, height, displayMaxWidthHeight, displayMaxWidthHeight, rotation))
 }
-
-const (
-	apkVersionCode = 4
-	apkVersionName = "1.0.4"
-)
 
 func checkUiautomatorInstalled() (ok bool) {
 	pi, err := androidutils.StatPackage("com.github.uiautomator")
@@ -470,7 +472,20 @@ func translateMinicap(conn net.Conn, jpgC chan []byte, quitC chan bool) error {
 	return err
 }
 
-func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
+type Server struct {
+	tunnel     *TunnelProxy
+	httpServer *http.Server
+}
+
+func NewServer(tunnel *TunnelProxy) *Server {
+	server := &Server{
+		tunnel: tunnel,
+	}
+	server.initHTTPServer()
+	return server
+}
+
+func (server *Server) initHTTPServer() {
 	m := mux.NewRouter()
 
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -750,7 +765,7 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel() // The document says need to call cancel(), but I donot known why.
-			httpServer.Shutdown(ctx)
+			server.httpServer.Shutdown(ctx)
 		}()
 	})
 
@@ -772,6 +787,13 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 		}
 	}).Methods("DELETE")
 
+	m.HandleFunc("/uiautomator", func(w http.ResponseWriter, r *http.Request) {
+		running := service.Running("uiautomator")
+		renderJSON(w, map[string]interface{}{
+			"running": running,
+		})
+	})
+
 	m.HandleFunc("/raw/{filepath:.*}", func(w http.ResponseWriter, r *http.Request) {
 		filepath := mux.Vars(r)["filepath"]
 		http.ServeFile(w, r, filepath)
@@ -780,7 +802,7 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 	// keep ApkService always running
 	// if no activity in 5min, then restart apk service
 	const apkServiceTimeout = 5 * time.Minute
-	apkServiceTimer := time.NewTimer(apkServiceTimeout)
+	apkServiceTimer := NewSafeTimer(apkServiceTimeout)
 	go func() {
 		for range apkServiceTimer.C {
 			log.Println("startservice com.github.uiautomator/.Service")
@@ -793,7 +815,7 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 		apkServiceTimer.Reset(apkServiceTimeout)
 		devInfo := getDeviceInfo()
 		devInfo.Battery.Update()
-		if err := tunnel.UpdateInfo(devInfo); err != nil {
+		if err := server.tunnel.UpdateInfo(devInfo); err != nil {
 			io.WriteString(w, "Failure "+err.Error())
 			return
 		}
@@ -816,19 +838,53 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 			}
 			deviceRotation = rotation
 		}
+
+		// Kill not controled minicap
+		killed := false
+		procWalk(func(proc procfs.Proc) {
+			executable, _ := proc.Executable()
+			if filepath.Base(executable) != "minicap" {
+				return
+			}
+			stat, err := proc.NewStat()
+			if err != nil || stat.PPID != 1 { // only not controled minicap need killed
+				return
+			}
+			if p, err := os.FindProcess(proc.PID); err == nil {
+				log.Println("Kill", executable)
+				p.Kill()
+				killed = true
+			}
+		})
+		if killed {
+			service.Start("minicap")
+		}
 		updateMinicapRotation(deviceRotation)
+
 		// APK Service will send rotation to atx-agent when rotation changes
 		runShellTimeout(5*time.Second, "am", "startservice", "--user", "0", "-n", "com.github.uiautomator/.Service")
 		fmt.Fprintf(w, "rotation change to %d", deviceRotation)
 	})
 
+	/*
+	 # URLRules:
+	 #   URLPath ends with / means directory, eg: $DEVICE_URL/upload/sdcard/
+	 #   The rest means file, eg: $DEVICE_URL/upload/sdcard/a.txt
+	 #
+	 # Upload a file to destination
+	 $ curl -X POST -F file=@file.txt -F mode=0755 $DEVICE_URL/upload/sdcard/a.txt
+
+	 # Upload a directory (file must be zip), URLPath must ends with /
+	 $ curl -X POST -F file=@dir.zip -F dir=true $DEVICE_URL/upload/sdcard/atx-stuffs/
+	*/
 	m.HandleFunc("/upload/{target:.*}", func(w http.ResponseWriter, r *http.Request) {
 		target := mux.Vars(r)["target"]
 		if runtime.GOOS != "windows" {
 			target = "/" + target
 		}
+		isDir := r.FormValue("dir") == "true"
 		var fileMode os.FileMode
-		if _, err := fmt.Sscanf(r.FormValue("mode"), "%o", &fileMode); err != nil {
+		if _, err := fmt.Sscanf(r.FormValue("mode"), "%o", &fileMode); !isDir && err != nil {
 			log.Printf("invalid file mode: %s", r.FormValue("mode"))
 			fileMode = 0644
 		} // %o base 8
@@ -842,27 +898,34 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 			file.Close()
 			r.MultipartForm.RemoveAll()
 		}()
-		if strings.HasSuffix(target, "/") {
-			target = path.Join(target, header.Filename)
-		}
 
-		targetDir := filepath.Dir(target)
+		var targetDir = target
+		if !isDir {
+			if strings.HasSuffix(target, "/") {
+				target = path.Join(target, header.Filename)
+			}
+			targetDir = filepath.Dir(target)
+		} else {
+			if !strings.HasSuffix(target, "/") {
+				http.Error(w, "URLPath must endswith / if upload a directory", 400)
+				return
+			}
+		}
 		if _, err := os.Stat(targetDir); os.IsNotExist(err) {
 			os.MkdirAll(targetDir, 0755)
 		}
 
-		fd, err := os.Create(target)
+		if isDir {
+			err = archiver.Zip.Read(file, target)
+		} else {
+			err = copyToFile(file, target)
+		}
+
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		defer fd.Close()
-		written, err := io.Copy(fd, file)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if fileMode != 0 {
+		if !isDir && fileMode != 0 {
 			os.Chmod(target, fileMode)
 		}
 		if fileInfo, err := os.Stat(target); err == nil {
@@ -871,7 +934,7 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"target": target,
-			"size":   written,
+			"isDir":  isDir,
 			"mode":   fmt.Sprintf("0%o", fileMode),
 		})
 	})
@@ -1263,23 +1326,41 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 	var handler = cors.New(cors.Options{
 		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE"},
 	}).Handler(m)
-	httpServer = &http.Server{Handler: handler} // url(/stop) need it.
-	return httpServer.Serve(lis)
+	server.httpServer = &http.Server{Handler: handler} // url(/stop) need it.
 }
 
-func runDaemon() {
-	environ := os.Environ()
-	// env:IGNORE_SIGHUP forward stdout and stderr to file
-	// env:ATX_AGENT will ignore -d flag
-	environ = append(environ, "IGNORE_SIGHUP=true", "ATX_AGENT=1")
-	cmd := kexec.Command(os.Args[0], os.Args[1:]...)
-	cmd.Env = environ
-	cmd.Start()
-	select {
-	case err := <-GoFunc(cmd.Wait):
-		log.Fatalf("server started failed, %v", err)
-	case <-time.After(200 * time.Millisecond):
-		fmt.Printf("server started, listening on %v:%d\n", mustGetOoutboundIP(), listenPort)
+func (s *Server) Serve(lis net.Listener) error {
+	return s.httpServer.Serve(lis)
+}
+
+func runDaemon() (cntxt *daemon.Context) {
+	cntxt = &daemon.Context{
+		PidFileName: "/sdcard/atx-agent.pid",
+		PidFilePerm: 0644,
+		LogFileName: "/sdcard/atx-agent.log",
+		LogFilePerm: 0640,
+		WorkDir:     "./",
+		Umask:       022,
+	}
+	child, err := cntxt.Reborn()
+	if err != nil {
+		log.Fatal("Unale to run: ", err)
+	}
+	if child != nil {
+		return nil // return nil indicate program run in parent
+	}
+	return cntxt
+}
+
+func stopSelf() {
+	// kill previous daemon first
+	log.Println("stop server self")
+	_, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/stop", listenPort))
+	if err == nil {
+		log.Println("wait server stopped")
+		time.Sleep(1000 * time.Millisecond) // server will quit in 0.1s
+	} else {
+		log.Println(err)
 	}
 }
 
@@ -1312,12 +1393,7 @@ func main() {
 	}()
 
 	if *fStop {
-		_, err := http.Get("http://127.0.0.1:7912/stop")
-		if err != nil {
-			log.Println(err)
-		} else {
-			log.Println("server stopped")
-		}
+		stopSelf()
 		return
 	}
 
@@ -1330,40 +1406,20 @@ func main() {
 		}
 	}
 
-	os.Setenv("TMPDIR", "/sdcard/")
-	if *fDaemon && os.Getenv("ATX_AGENT") == "" {
-		runDaemon()
-		return
+	if _, err := os.Stat("/sdcard/tmp"); err != nil {
+		os.MkdirAll("/sdcard/tmp", 0755)
 	}
+	os.Setenv("TMPDIR", "/sdcard/tmp")
 
-	if os.Getenv("IGNORE_SIGHUP") == "true" {
-		fmt.Println("Enter into daemon mode")
-		os.Unsetenv("IGNORE_SIGHUP")
-
-		os.Rename("/sdcard/atx-agent.log", "/sdcard/atx-agent.log.old")
-		f, err := os.Create("/sdcard/atx-agent.log")
-		if err != nil {
-			panic(err)
+	if *fDaemon {
+		cntxt := runDaemon()
+		if cntxt == nil {
+			log.Printf("Enter into daemon mode, listening on %v:%d", mustGetOoutboundIP(), listenPort)
+			return
 		}
-		defer f.Close()
-
-		os.Stdout = f
-		os.Stderr = f
-		os.Stdin = nil
-
-		log.SetOutput(f)
-		log.Println("Ignore SIGHUP")
-		signal.Ignore(syscall.SIGHUP)
-
-		// kill previous daemon first
-		log.Println("Kill server")
-		_, err = http.Get(fmt.Sprintf("http://127.0.0.1:%d/stop", listenPort))
-		if err == nil {
-			log.Println("wait previous server stopped")
-			time.Sleep(1000 * time.Millisecond) // server will quit in 0.1s
-		} else {
-			log.Println(err)
-		}
+		defer cntxt.Release()
+		log.Print("- - - - - - - - - - - - - - -")
+		log.Print("daemon started")
 	}
 
 	fmt.Printf("atx-agent version %s\n", version)
@@ -1403,11 +1459,17 @@ func main() {
 		Stderr:          os.Stderr,
 		MaxRetries:      3,
 		RecoverDuration: 30 * time.Second,
+		OnStart: func() error {
+			log.Println("service uiautomator: startservice com.github.uiautomator/.Service")
+			runShell("am", "startservice", "-n", "com.github.uiautomator/.Service")
+			return nil
+		},
+		OnStop: func() {
+			log.Println("service uiautomator: stopservice com.github.uiautomator/.Service")
+			runShell("am", "stopservice", "-n", "com.github.uiautomator/.Service")
+		},
 	})
 	if !*fNoUiautomator {
-		if _, err := runShell("am", "start", "-W", "-n", "com.github.uiautomator/.MainActivity"); err != nil {
-			log.Println("start uiautomator err:", err)
-		}
 		if err := service.Start("uiautomator"); err != nil {
 			log.Println("uiautomator start failed:", err)
 		}
@@ -1422,6 +1484,8 @@ func main() {
 		go tunnel.Heratbeat()
 	}
 
+	server := NewServer(tunnel)
+
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -1429,11 +1493,11 @@ func main() {
 			log.Println("receive signal", sig)
 			service.StopAll()
 			os.Exit(0)
-			httpServer.Shutdown(context.TODO())
+			server.httpServer.Shutdown(context.TODO())
 		}
 	}()
 	// run server forever
-	if err := ServeHTTP(listener, tunnel); err != nil {
+	if err := server.Serve(listener); err != nil {
 		log.Println("server quit:", err)
 	}
 }
